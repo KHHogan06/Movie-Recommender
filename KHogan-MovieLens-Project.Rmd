@@ -1,0 +1,1199 @@
+---
+title: "\\vspace{-1.9cm} MovieLens Recommendation System "
+subtitle: "\\vspace{-.1cm} HarvardX Capstone Project \\vspace{-.5cm}"
+author: " K. H. Hogan \\vspace{-.9cm}"
+date: " 8 December 2020 \\vspace{-.3cm}"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, fig.align = "center", fig.width = 4, fig.height = 2.75)
+```
+
+```{r libraries, message = FALSE, error = FALSE,  warning = FALSE}
+
+library(tidyverse)
+library(caret)
+library(data.table)
+library("viridis")
+library(gridExtra) 
+library(lubridate)
+library(knitr)
+library(kableExtra)
+library(recosystem)
+
+# to not display scientific notation
+options(scipen = 999)
+```
+
+
+## Introduction
+
+Recommendation systems are machine learning algorithms that make predictions from ratings users have given relevant items. Netflix has, perhaps, the most well-known movie recommendation system.  The HarvardX Data Science Capstone project is to create a movie recommendation system from the MovieLens 10M dataset.  The assignment perform data analysis, data wrangling, the use  discovered predictors to train a model to predict ratings. The MovieLens 10M dataset was collected by and obtained from the GroupLens research lab at the University of Minnesota. The data can be found at: [https://grouplens.org/datasets/movielens/](https://grouplens.org/datasets/movielens/)
+
+Prior to training an algorithm, the data must be split into separate training and validation sets. Here the training set will contain 90% of the data and used for analysis and exploration. The validation set contains the remaining 10% will is used only to validate the final model results.  
+
+After visually exploring the training set, key predictors showing variability in ratings will be chosen to train the model. The training set will be split 90/10 again for model building and evaluation. According to class instructions, I will assume a Bayesian approach and begin the model based on the simplest prediction: the average rating of the training set.  The recommendation algorithm will be built by calculating the effects of chosen predictors on the benchmark average rating. Once all effects are applied, a set of predicted ratings will be calculated and tested against the validation set ratings. Model performance will be evaluated by root mean square error.  
+\  
+
+
+```{r creating training & test sets, message = FALSE, error = FALSE, warning = FALSE}
+# Create edx training set, validation set (final hold-out test set). (Code was provided as part of capstone project set up.)
+# Note: this process could take a couple of minutes
+
+# MovieLens 10M dataset: https://grouplens.org/datasets/movielens/10m/
+
+dl <- tempfile()
+download.file("http://files.grouplens.org/datasets/movielens/ml-10m.zip", dl)
+
+ratings <- fread(text = gsub("::", "\t", readLines(unzip(dl, "ml-10M100K/ratings.dat"))),
+                 col.names = c("userId", "movieId", "rating", "timestamp"))
+
+movies <- str_split_fixed(readLines(unzip(dl, "ml-10M100K/movies.dat")), "\\::", 3)
+colnames(movies) <- c("movieId", "title", "genres")
+
+# Using code for R 4.0 or later:
+movies <- as.data.frame(movies) %>% mutate(movieId = as.numeric(movieId),
+                                            title = as.character(title),
+                                            genres = as.character(genres))
+
+movielens <- left_join(ratings, movies, by = "movieId")
+
+
+# Partition data. Validation set will be 10% of MovieLens data
+set.seed(1, sample.kind="Rounding") 
+test_index <- createDataPartition(y = movielens$rating, times = 1, p = 0.1, list = FALSE)
+edx <- movielens[-test_index,]
+temp <- movielens[test_index,]
+
+# Make sure userId and movieId in validation set are also in edx set
+validation <- temp %>% 
+      semi_join(edx, by = "movieId") %>%
+      semi_join(edx, by = "userId")
+
+# Add rows removed from validation set back into edx set
+removed <- anti_join(temp, validation)
+edx <- rbind(edx, removed)
+
+rm(dl, ratings, movies, test_index, temp, movielens, removed)
+```
+  
+  
+  
+## Data Analysis
+
+### Data Exploration
+
+The MovieLens 10M dataset contains 10 million observations and is a sparse ratings matrix meaning that not all users have rated all movies.  Totals and average movie rating in the training set:
+
+```{r edx totals, message = FALSE, error = FALSE,  warning = FALSE}  
+
+# Exploring data
+kable(edx %>% summarize(Users = n_distinct(userId), Movies = n_distinct(movieId), Ratings = n(), Average_Rating= mean(rating))) %>%
+    kable_styling(font_size = 10, latex_options = "hold_position")
+```  
+  
+
+Variables provided include: userId, movieId, rating, timestamp of rating, movie title with year released, and genres.  
+
+```{r head edx, message = FALSE, error = FALSE,  warning = FALSE}   
+
+kable(head(edx, 6), booktabs = TRUE, caption = "First lines of data set:") %>%
+  kable_styling(font_size = 9, latex_options = "hold_position")
+
+```
+  
+  
+Since the model is predicting ratings, it is important to see the distribution of ratings in the data.  
+
+```{r ratings, error=FALSE, message=FALSE, warning=FALSE, fig.width = 3.5, fig.height=2.5}
+
+# Ratings 
+edx %>% group_by(rating) %>% summarize(n = n()) %>%
+  ggplot(aes(rating, n)) + 
+    geom_bar(stat = "identity", fill = "slategrey") + 
+  geom_text(aes(label = n), size = 2, vjust = -.5, alpha = 3/4) + labs(x="Ratings",y="") + 
+    geom_vline(xintercept = mean(edx$rating), color = "blue", linetype = "dashed", size = 1, alpha = 1/2) +  
+  annotate("text", x = 2.5, y = 2555000, label = "Average Rating: 3.51", color = "blue", size = 2.5) + theme_bw(base_size = 9) + 
+    theme(axis.text.y=element_blank(), axis.ticks.y = element_blank(), plot.title = element_text(size = 10)) + 
+    ggtitle("Ratings in Dataset")
+```  
+
+The majority of user ratings are 3 or higher. Looking at ratings by movie, shows that movies with more ratings tend to have higher ratings, and the majority movies have less than 5000 ratings.  
+  
+  
+  
+  
+```{r ratings2, message = FALSE, error = FALSE, warning = FALSE}  
+
+# Average movie rating vs # of ratings. 
+edx %>% group_by(movieId) %>% summarize(avg = mean(rating), n = n()) %>% 
+  ggplot(aes(avg, n, size = n)) +
+  geom_point(alpha = 1/5, color = "blue") + 
+  xlab("Average Movie Rating") + ylab("") + theme_bw(base_size = 9) + 
+  theme(legend.position="bottom", plot.title = element_text(size = 10)) + ggtitle("Average Movie Rating by Number of Ratings")
+
+```  
+  
+  
+  
+  
+  
+Visualizing average ratings by movie and by user show a lot of variability centering between 3 and 4 indicating movie and user specific effects.  
+
+```{r movie-user-ratings, message = FALSE, error = FALSE,  warning = FALSE, fig.width=7}  
+
+# Average movie ratings
+by_movie <- edx %>% group_by(title) %>% summarize(avg = mean(rating), n = n()) %>% 
+  ggplot(aes(title, avg, size = n)) +
+  geom_point(alpha = 1/5, color = "blue") +  
+  ylab("Ratings") + scale_x_discrete(name = "Movies", labels = NULL) + theme_bw(base_size = 9) +
+  theme(axis.text.x=element_blank(), panel.grid=element_blank(), plot.title = element_text(size = 10), legend.position = "none") + 
+  ggtitle("Average Ratings by Movie")
+
+# Average user ratings
+by_user <- edx %>% group_by(userId) %>% summarize(avg = mean(rating), n = n()) %>% 
+  ggplot(aes(userId, avg, size = n)) +
+  geom_point(alpha = 1/10, color = "blue") +
+  labs(x = "Users", y= "") + theme_bw(base_size = 9) + 
+  theme(axis.text.x=element_blank(), panel.grid=element_blank(), legend.position = "none", plot.title = element_text(size = 10)) +
+  ggtitle("Average Rating by User")
+
+
+grid.arrange(by_movie, by_user, ncol = 2)
+
+rm(by_movie, by_user)
+```
+  
+  
+Users' ratings appear to average slightly higher than movie ratings.  
+  
+Movie Average: `r edx %>% group_by(movieId) %>% summarize(avg = mean(rating)) %>% summarize(Overall = round(mean(avg), digits = 3))`
+User Average: `r edx %>% group_by(userId) %>% summarize(avg = mean(rating)) %>% summarize(Overall = round(mean(avg), digits = 3))`  
+  
+
+Next I want to explore date effects, but the the data must be transformed first.  
+
+\  
+
+
+
+
+### Data Cleaning
+
+Initial data cleaning involves creating new variables by separating the year released from the title and converting the timestamp into a readable date rated.  I will also create an age of the movie when rated column.  
+  
+  
+
+```{r data cleaning, echo=FALSE, error=FALSE, message=FALSE, warning=FALSE}
+
+#Converting timestamp to date, separating year from title
+edx1 <- edx %>% mutate(date_rated = as_datetime(timestamp), year = str_extract(title, "\\(\\d{4}\\)") %>% str_remove_all("[\\(\\)]"),
+                      title = str_remove(title, "\\(\\d{4}\\)$") %>% str_trim())
+
+#Removing hhmmss from date_rated & timestamp
+edx1 <- edx1 %>% mutate(date_rated = date(date_rated)) %>% select(-timestamp)
+#Calculating age(in years) & by week of movie when rated & converting year to numeric
+edx1 <- edx1 %>% mutate(age_rated = as.numeric(year(date_rated)) - as.numeric(year), year = as.numeric(year), week_rated = round_date(date_rated, unit = "week")) 
+
+##- Found -1 age_rated values with timestamp before year in title. Updated to 0.
+edx1$age_rated[edx1$age_rated < 0] <- 0
+
+# Removing original & large edx
+rm(edx)
+
+``` 
+  
+  
+### Data Analysis  
+
+It is now possible to visual average ratings by year movie was released and date rated to look for variability.  
+  
+```{r time-effects, message = FALSE, error = FALSE,  warning = FALSE, fig.width=7}
+
+# Exploring average rating by year movie released
+by_year <- edx1 %>% group_by(year) %>% 
+  summarize(avg = mean(rating), n = n()) %>%
+  ggplot(aes(year, avg, size = n)) + ylim(2,4.5) +
+  geom_point(alpha = 1/4) + geom_smooth() + scale_x_reverse() +
+  theme_bw(base_size = 9) + labs(x="year released",y="rating") +
+  theme(legend.position = "none", plot.title = element_text(size = 10)) + 
+  ggtitle("Average Rating by Year Movie Released")  
+  
+# Exploring average rating by age of movie when rated
+by_agerated <- edx1 %>% group_by(age_rated) %>% 
+  summarize(avg = mean(rating), n = n()) %>%
+  ggplot(aes(age_rated, avg, size = n)) + ylim(2,4.5) +
+  geom_point(alpha = 1/3) + geom_smooth(model = glm) +
+  theme_bw(base_size = 9) + labs(x="age when rated", y="") +
+  theme(legend.position = "none", plot.title = element_text(size = 10)) + 
+  ggtitle("Rating by Age of Movie When Rated")
+
+
+grid.arrange(by_year, by_agerated, ncol = 2)
+
+rm(by_year, by_agerated)
+```  
+  
+  
+There is a pattern for higher ratings for older movies both for year movie was released and age of movie when rated.  The pattern is very similar, but the variability is different.  I will explore both as predictors.
+
+
+
+Now I will look for effects of time-based, user-specific effects of date movie was rated and if their ratings change over time.
+
+
+```{r time-effects2, message = FALSE, error = FALSE,  warning = FALSE, fig.width = 7}
+
+# Rating by date rated rounded by week 
+by_daterated <- edx1 %>% group_by(week_rated) %>% summarize(avg = mean(rating), n = n()) %>%
+  ggplot(aes(week_rated, avg, size = n)) +
+  geom_point(alpha = 1/4) + geom_smooth() + ylim(2,4.5) +
+  theme_bw(base_size = 9) + labs(x="rating by week rated", y="ratings") +
+  theme(legend.position = "none", plot.title = element_text(size = 10)) + 
+  ggtitle("Average Rating by Week Rated")
+
+# Rating by number of days since user started rating movies
+by_userweeks <- edx1 %>% group_by(userId) %>% mutate(days_rated = as.numeric(date_rated - min(date_rated))) %>%
+  ungroup() %>% group_by(days_rated) %>%
+  summarize(avg = mean(rating), n = n()) %>%
+  ggplot(aes(days_rated, avg, size = n)) + geom_point(alpha = 1/5) + 
+  labs(x = "days since first rating", y = "") + theme_bw(base_size = 9) + 
+  theme(legend.position = "none", plot.title = element_text(size = 10)) + 
+  ggtitle("Average Rating Since User's First Rating")
+
+grid.arrange(by_daterated, by_userweeks, ncol = 2)
+
+rm(by_daterated, by_userweeks)
+
+```  
+  
+  
+Both the year movie was released and age of movie when rated show some variability. The time of year of when rated and how long the user has been rating movies show variability.  
+  
+  
+Since ratings by days become more sparse as time increased, I will round to weeks rated to prevent NAs in the data.  I must perform additional pre-processing to extract how many weeks since the user first started rating movies.  To discover the true first date rated will mean comparing the minimum date rated by user in both the training and test tests, choosing the date and then adding it back to both sets.  
+
+ 
+```{r date first rated, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Discovering first date rated by user between sets 
+
+# Must convert timestamp from validation set & will parse out year released
+# Pre-processing of validation set to match edx1 training set     
+validation1 <- validation %>% mutate(date_rated = as_datetime(timestamp), year = str_extract(title, "\\(\\d{4}\\)") %>%
+                                       str_remove_all("[\\(\\)]"), title = str_remove(title, "\\(\\d{4}\\)$") %>% str_trim())
+
+# Removing hhmmss from date_rated & timestamp
+validation1 <- validation1 %>% mutate(date_rated = date(date_rated)) %>% select(-timestamp)
+
+# Calculating age of movie when rated & converting year to numeric
+validation1 <- validation1 %>% mutate(age_rated = as.numeric(year(date_rated)) - as.numeric(year), year = as.numeric(year), week_rated = round_date(date_rated, unit = "week"))
+
+# Found -1 age_rated values when movies rated just before year given in title.
+validation1$age_rated[validation1$age_rated < 0] <- 0
+
+# Creating dataframe to compare & choose first date rated, calculating number of weeks since first rating, adding to both sets. 
+daysu_e <- edx1 %>% group_by(userId) %>% summarize(first_rated_e = min(date_rated))
+daysu_v <- validation1 %>% group_by(userId) %>% summarize(first_rated_v = min(date_rated)) 
+user_firsts <- merge(daysu_e, daysu_v, by="userId")
+user_firsts <- user_firsts %>% mutate(first_rated = pmin(first_rated_e, first_rated_v)) %>% select(userId,first_rated)
+
+edx1 <- merge(edx1, user_firsts, by = "userId", all = TRUE)  
+edx1 <- edx1 %>% group_by(userId) %>% mutate(weeksrated_u = round((as.numeric(date_rated - first_rated))/7))
+
+```
+\  
+  
+  
+I am also interested in the power of genres as predictors.  
+  
+  
+  
+```{r exploring-genres, message = FALSE, error = FALSE,  warning = FALSE, fig.width=3.5, fig.height=2.5}
+
+# Average rating by genre combination
+genre_combos <- edx1 %>% group_by(genres) %>% summarize(avg = mean(rating), movies = n_distinct(movieId), n = n())
+
+genre_combos %>% 
+  ggplot(aes(genres, avg, size = n)) + geom_point(alpha = 1/5, color = "blue") + 
+  ylim(0,5) + ylab("ratings") + scale_x_discrete(name = "genres", labels = NULL) +
+  theme(legend.position = "none", plot.title = element_text(size = 10), text=element_text(size=9)) +
+  ggtitle("Average Rating by Genre Combinations")
+```  
+
+Genres also show a lot of variability. There are 797 unique combinations of genres.  
+  
+
+```{r genres-combinations, message = FALSE, error = FALSE,  warning = FALSE}
+
+gc_top10 <- genre_combos %>% arrange(desc(avg)) %>% slice(1:10)
+
+kable(gc_top10, booktabs = TRUE, digits = 2, caption = "Top 10 rated genres") %>%
+  kable_styling(font_size = 8, latex_options = "HOLD_position")
+
+rm(gc_top10)
+
+```
+
+In the top 10 rated genres, all but one have three or more genres, and half have only 1 movie.  
+  
+Exploring further, I find the number of movies per combination varies a lot with a range of `r range(genre_combos$movies)`. The number of ratings varies even more: `r range(genre_combos$n)`. Unfortunately, `r sum(genre_combos$movies < 5)` genre combinations have less than five movies, and `r sum(genre_combos$n < 50)` have less than 50 ratings.  With so many movies having a unique genre combination, the format of this variable reduces it's predictive capability and cannot capture the interaction of genres on ratings.  
+  
+  
+The genres variable needs to be split out to explore genres individually.
+
+
+```{r separating-genres, message = FALSE, error = FALSE,  warning = FALSE}
+
+#  separating genres out.. duplicating movies      
+edx1 <- edx1 %>% relocate(genres, .after = last_col())
+edx_g <- edx1 %>% separate_rows(genres, sep ="\\|") 
+
+```
+
+
+```{r genre-rankings, message = FALSE, error = FALSE,  warning = FALSE, fig.width = 7, fig.height= 4}
+
+# Avg ratings by genres& number of ratings for genre
+genre1 <- edx_g %>% group_by(genres) %>% summarise(avg = mean(rating), movies = n_distinct(movieId), n = n()) %>%
+  ggplot(aes(x= avg, y = reorder(genres, avg), fill = -avg, label = n)) + xlim(0,5) +
+  geom_bar(stat = "identity")  +  geom_text(size = 2, color = "#333333", hjust = 0, nudge_x = 0.03) +
+  scale_fill_viridis() + xlab("Average Rating (with number of ratings)") + ylab("") + theme_bw(base_size = 9) +
+  theme(legend.position = "none", plot.title = element_text(size = 10), panel.grid = element_blank()) + 
+  ggtitle("Average Rating by Genre")
+
+# Number of ratings/avg by genre
+genre2 <- edx_g %>% group_by(genres) %>% summarise(avg = mean(rating), movies = n_distinct(movieId), n = n()) %>%
+  ggplot(aes(x= n, y = reorder(genres, n), fill = -n, label = sprintf("%0.2f", round(avg, digits = 2)))) +
+  geom_bar(stat = "identity")  + geom_text(size = 2, digits = 3,color = "#333333", hjust = 0, nudge_x = .03) +
+  scale_fill_viridis() + xlab("Number of Ratings (with avg rating)") + ylab("") + theme_bw(base_size = 9) + 
+  theme(legend.position = "none", plot.title = element_text(size = 10), panel.grid = element_blank()) + 
+  ggtitle("Number of Ratings by Genre")
+
+grid.arrange(genre1, genre2, ncol = 2)
+
+rm(genre1,genre2)
+```  
+  
+  
+The number of ratings per genre vs average rating per genre does not follow the trend observed earlier where movies with more ratings average higher.  The modeling for this project and limits the ability to model on the interaction of the genres.  It would be best to split the genres out to separate variables, but that would increase the size of the dataset or make the used in the project extremely long. Instead, I will include both this combination of genres as a predictor and will perform matrix factorization of the residuals of the model. 
+
+Considering the data further, I can see there are also "no genres listed" and IMAX genres.  Should IMAX be considered a genre?  
+
+```{r IMAX movies/no genre, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Movies with 'no genres listed'
+no_genre <- edx1 %>% filter(genres == "(no genres listed)") %>% distinct(title)  
+
+
+# Exploring IMAX movies 
+IMAX <- edx1 %>% filter(str_detect(genres,"IMAX")) %>% group_by(movieId, title, genres) %>% summarize(avg = mean(rating), n = n())
+
+```  
+  
+There is only one movie with no genre: `r no_genre[1,]$title` which was a short drama according to Wikipedia. I will and update the movie's genre.  There are only `r n_distinct(IMAX$title)` IMAX movies and `r n_distinct(IMAX$genres)` IMAX genres.  
+  
+  
+```{r IMAX movies2, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Top rated IMAX movies 
+IMAX_top <- IMAX %>% filter(n>60) %>% arrange(desc(n))
+
+kable(IMAX_top, booktabs = TRUE, digits = 2, caption = "Top 10 IMAX Movies") %>%
+  kable_styling(font_size = 8, latex_options = "HOLD_position")
+
+```  
+  
+  
+Five of the top rated IMAX movies are blockbuster films which were additionally released in IMAX.  Therefore the IMAX genre included could lead to overtraining.  I will remove IMAX from these films since most viewers would not have been watching the movie in IMAX.  
+  
+  
+  
+```{r updating genres, message = FALSE, error = FALSE,  warning = FALSE}
+
+#Updating no genre listed to drama  
+edx1$genres[which(edx1$genres == "(no genres listed)")] <- "Drama"
+
+#Removing IMAX from blockbuster movies which were shown on regular screens as well.
+edx1 <-  edx1 %>% mutate(genres = ifelse(movieId %in% c(8965, 54001, 58559, 62999, 3159), str_remove(genres, "\\|IMAX"), genres))
+
+
+rm(IMAX, edx_g, genre_combos, IMAX_top) 
+```  
+  
+```{r splitting training data for modeling, message = FALSE, error = FALSE,  warning = FALSE}  
+
+set.seed(1, sample.kind="Rounding")
+index_edx <- createDataPartition(y = edx1$rating, times = 1, p = 0.1, list = FALSE)
+train <- edx1[-index_edx,]
+temp <- edx1[index_edx,]
+
+test <- temp %>% 
+  semi_join(train, by = "movieId") %>%
+  semi_join(train, by = "userId")
+
+removed <- anti_join(temp, test)
+
+train <- rbind(train, removed)
+
+# Removing objects not used in modeling
+rm(index_edx, temp, removed, edx1)
+```
+  
+  
+  
+Now I will inspect the additional modeling ability the my chosen predictors:  
+
+  
+```{r predictors, message = FALSE, error = FALSE,  warning = FALSE, fig.width=4.5, fig.height=3}
+
+# Distribution of features for modeling
+mu <- mean(train$rating)
+
+# Distribution of features for modeling
+
+h_i <- train %>% group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu)) %>%
+  ggplot(aes(b_i)) + geom_histogram(bins = 10) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("Movie Effect")
+
+h_u <- train %>% group_by(userId) %>% 
+  summarize(b_u = mean(rating - mu)) %>%
+  ggplot(aes(b_u)) + geom_histogram(bins = 10) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("User Effect")
+
+h_y <- train %>% group_by(year) %>% 
+  summarize(b_y = mean(rating - mu)) %>%
+  ggplot(aes(b_y)) + geom_histogram(bins = 15) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("Year Released")
+
+h_a <- train %>%group_by(age_rated) %>%
+  summarize(b_a = mean(rating - mu)) %>%
+  ggplot(aes(b_a)) + geom_histogram(bins = 15) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("Movie Age When Rated")
+
+h_w <- train %>% group_by(week_rated) %>% 
+  summarize(b_w = mean(rating - mu)) %>%
+  ggplot(aes(b_w)) + geom_histogram(bins = 15) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("Date Rated by Week")
+
+h_uw <- train %>% group_by(weeksrated_u) %>%
+  summarize(b_uw = mean(rating - mu)) %>%
+  ggplot(aes(b_uw)) + geom_histogram(bins = 15) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("Weeks Since 1st Rating")
+
+h_g <- train %>% group_by(genres) %>% 
+  summarize(b_g = mean(rating - mu)) %>%
+  ggplot(aes(b_g)) + geom_histogram(bins = 15) + ylab("") +
+  theme_bw(base_size = 9) + theme(plot.title = element_text(size = 8)) + ggtitle("Genre Combinations")
+
+gridExtra::grid.arrange(h_i, h_u, h_y, h_a, h_w, h_uw, h_g, ncol = 3)
+
+```
+  
+  
+Each chosen predictor shows predictive power varying between a range of .75 to 3 points.  This appears promising, but it also shows the possibility of calculating predictions outside of the ratings range of 0.5 to 5.  The prediction range will need to be monitored.  Also, while genre combinations has the one of the largest distributions, many of the combinations have few movies, I hypothesize that modeling with the genre combinations as grouped in the dataset will limit its predictive power.  
+  
+  
+  
+
+```{r pre-processing validation data, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Updating no genres & IMAX blockbusters
+validation1$genres[which(validation1$genres == "(no genres listed)")] <- "Drama"
+validation1 <- validation1 %>% mutate(genres = ifelse(movieId %in% c(8965, 54001, 58559, 62999, 3159), str_remove(genres, "\\|IMAX"), genres))
+
+# Adding weeks since user's first rating 
+validation1 <- merge(validation1, user_firsts, by = "userId", all = TRUE)           
+validation1 <- validation1 %>% group_by(userId) %>% mutate(weeksrated_u = round((as.numeric(date_rated - first_rated))/7))
+
+
+# Removing objects out of environment to increase available space.
+rm(validation, user_firsts, daysu_v, daysu_e,
+   h_i, h_u, h_a, h_g, h_uw, h_w, h_y)
+```
+  
+\newpage 
+
+
+
+
+## Modeling Methods & Results
+
+
+### Model Evaluation
+
+To evaluate the model, predictions will be compared against test set data to obtain RMSE. The goal of the project is to achieve a Root Mean Squared Error (RMSE) < 0.8649 on the validation set.
+$$RMSE = \sqrt{\frac{1}{N}\sum_{i,u}(\hat{y}_{i,u} - y_{i,u})^{2}}$$
+For comparison the team who won NetFlix's 2009 challenge to improve their recommendation system by 10% had to achieve an RMSE of about 0.857.  (Incidentally, that team won a $1 million prize!)  
+
+  
+  
+### Model Building
+
+
+Due to the size of the dataset and small processor capability of laptops, modeling approaches are limited. Per project instructions, I will build on the recommendation system model presented in HarvardX's Machine Learning course. The model will  be built using the mean calculated at 3.512 then adding on predictor effects, referred to as biases, discovered during data exploration to the base model.  I will run each predictor as a model in order to measure decrease in RMSE.  From my prior analysis chosen effects include:
+
+  * b_{i}:  movie-specific effects 
+  * b_{u}:  user-specific effects
+  * b_{y}:  year the movie was released
+  * b_{a}:  age of the movie when it was rated
+  * b_{d}:  date when the movie was rated (by week)
+  * b_{uw}: number of weeks since the user's first rating
+  * b_{g}:  genre effect (with genre combinations)
+  
+  
+\  
+\  
+
+  
+**Base Model**: The base model is just the average of all ratings in the dataset. It assumes any predicted rating (Y) is the average rating ($\mu$) for all movies ($i$) and users ($u$) where differences are explained as independent errors ($\varepsilon$).   $Y_{i,u} = \mu + \varepsilon_{i,u}$
+
+
+```{r base model, message = FALSE, error = FALSE,  warning = FALSE}
+
+mu <- mean(train$rating) 
+
+just_avg <- RMSE(test$rating, mu)
+
+rmse_results <- tibble(Model = "Naive Bayes", RMSE = just_avg)
+
+kable(rmse_results, booktabs = TRUE) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+```
+
+  
+ 
+**Model 1**: Adds movie-specific effect (b~i~) to the base model.  $Y_{i,u} = \mu + b_{i} + \varepsilon_{i,u}$     
+
+```{r model1, message = FALSE, error = FALSE,  warning = FALSE}
+
+movie_avgs <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = mean(rating - mu))
+
+predicted_ratings1 <- mu + test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  pull(b_i)
+
+model1_rmse <- RMSE(predicted_ratings1, test$rating)  
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model = "Movie Effect", RMSE = model1_rmse ))
+
+kable(rmse_results %>% filter(Model == "Movie Effect"), booktabs = TRUE) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+```
+  
+  
+    
+**Model 2**: Adds user-specific (b~u~) effects.  $Y_{i,u} = \mu + b_{i} + b_{u} + \varepsilon_{i,u}$  
+
+
+```{r model2, message = FALSE, error = FALSE,  warning = FALSE}
+
+user_avgs <- train %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = mean(rating - mu - b_i))
+
+predicted_ratings2 <- test %>% 
+  left_join(movie_avgs, by='movieId') %>%
+  left_join(user_avgs, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>%
+  pull(pred)
+
+model2_rmse <- RMSE(predicted_ratings2, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model = "Movie + User Effects",  RMSE = model2_rmse))
+
+rmse_results %>% filter(RMSE == model2_rmse) %>% kable() %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+```
+  
+As I add on effects, I need to check the range of my predictions. Model 2 prediction range: `r round(range(predicted_ratings2), digits = 3)` The calculated predictions are already outside of the possible ratings range of 0.5 to 5.  I will simply update any predictions under 0.5 and over 5 to those ratings.
+  
+**Model 2b**: Applies upper and lower limits.  $Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} + b_{u} + \varepsilon_{i,u})$  
+
+```{r model2-range, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Updating predictions to min and max
+predicted_ratings2[predicted_ratings2 < 0.5] <- .5
+predicted_ratings2[predicted_ratings2 > 5] <- 5
+
+
+model2L_rmse <- RMSE(predicted_ratings2, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model = "Movie + User Effects with limits",  RMSE = model2L_rmse))
+
+kable(rmse_results %>% filter(RMSE == model2L_rmse)) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+# removing large/temp object
+rm(predicted_ratings1, predicted_ratings2)
+
+```
+  
+  
+Correcting out of range predictions does slightly improve RMSE. I will add this step after each prediction.  
+  
+  
+  
+**Model 3**: Applies regularization to movie and effects.  In model 1 and 2, all movies and users are weighted equally. Data exploration showed that some movies have very few ratings while other have thousands.  Therefore, weighing the effects of movies and users with one rating the same as those with a 1000 ratings can lead to poor results. Introducing regularization to the model will apply a penalty term the the number of ratings to minimize effects of those with few observations.  
+
+The movie effect penalty term will be calculated as: $b{_i}(\lambda) = \frac{1}{n_{i} + \lambda}  \sum_{u=1}^{n_{i}}(Y_{i,u} - \hat{\mu})$  
+  
+    
+We now calculate with penalized least squares. $\sum_{i,u}(y_{i,u} - \mu - b{_i} - b{_u}) + \lambda(\sum_{i}b_{i}^{2} + \sum_{u}b_{u}^{2})$  
+  
+
+
+```{r cross-validation, message = FALSE, error = FALSE,  warning = FALSE, fig.width=3.25, fig.height =2}
+
+# Cross validation to find lambda. This will take a few minutes.
+lambdas <- seq(1, 6, 0.25)
+
+rmses <- sapply(lambdas, function(l){
+  
+  mu <- mean(train$rating)
+  
+  b_i <- train %>% 
+    group_by(movieId) %>% 
+    summarize(b_i = sum(rating - mu)/(n()+l))
+  
+  b_u <- train %>% 
+    left_join(b_i, by="movieId") %>%
+    group_by(userId) %>%
+    summarize(b_u = sum(rating - b_i - mu)/(n()+l))
+  
+  predicted_ratings <- test %>% 
+    left_join(b_i, by = "movieId") %>%
+    left_join(b_u, by = "userId") %>%
+    mutate(pred = mu + b_i + b_u) %>% 
+    pull(pred)
+  
+  return(RMSE(predicted_ratings, test$rating))
+})
+
+qplot(lambdas, rmses)  
+lambda <- lambdas[which.min(rmses)]
+```
+
+The Lambda which minimizes RMSE is `r lambda`.  
+$$Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + \varepsilon_{i,u})$$ 
+
+
+```{r model3 reg, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Model with Regularization for Movie, user & Year Released Effects with lambda at 4.75
+movieavgs_reg <- train %>% 
+  group_by(movieId) %>% 
+  summarize(b_i = sum(rating - mu)/(n()+lambda)) 
+
+useravgs_reg <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  group_by(userId) %>%
+  summarize(b_u = sum(rating - mu - b_i)/(n()+lambda))
+
+predicted_ratings_reg <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  mutate(pred = mu + b_i + b_u) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratings_reg[predicted_ratings_reg < 0.5] <- .5
+predicted_ratings_reg[predicted_ratings_reg > 5] <- 5
+
+# Calculating RMSE
+model3_rmse <- RMSE(predicted_ratings_reg, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model = "Movie & User Regularized Effects", RMSE = model3_rmse ))
+
+kable(rmse_results %>% filter(RMSE == model3_rmse)) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+# removing large/temp object
+rm(predicted_ratings_reg)
+```
+  
+  
+  
+Introducing regularization and updating out of limit predictions, reduces the modeling RMSE below the project goal (at least for the test set).  Results will continue to improve by continuing to add on effects from above analysis.  
+  
+  
+  
+**Model 4**: Adds year the movie was released (b~y~) effect.  $Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + b_{y} + \varepsilon_{i,u})$ 
+
+  
+
+```{r model4, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Model including year movie was released
+year_avgs <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  group_by(year) %>%
+  summarize(b_y = mean(rating - mu - b_i - b_u))
+
+predicted_ratings4 <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  mutate(pred = mu + b_i + b_u + b_y) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratings4[predicted_ratings4 < 0.5] <- .5
+predicted_ratings4[predicted_ratings4 > 5] <- 5
+
+# Calculating RMSE
+model4_rmse <- RMSE(predicted_ratings4, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model = "Movie&User Regularized + Year Released Effects",  RMSE = model4_rmse))
+
+kable(rmse_results %>% filter(RMSE == model4_rmse)) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+```  
+  
+  
+
+**Model 5**: Adds age of the movie (b~a~) when it was rated. 
+$$Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + b_{y} + b_{a} + \varepsilon_{i,u})$$ 
+
+```{r model 5, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Model with age of movie when rated 
+age_rated_avgs <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  group_by(age_rated) %>%
+  summarize(b_a = mean(rating - mu - b_i - b_u - b_y))
+
+predicted_ratings5 <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  mutate(pred = mu + b_i + b_u + b_y + b_a) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratings5[predicted_ratings5 < 0.5] <- .5
+predicted_ratings5[predicted_ratings5 > 5] <- 5
+
+# Calculating RMSE
+model5_rmse <- RMSE(predicted_ratings5, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model= "Movie&User Reg + Year + Age When Rated",  RMSE = model5_rmse ))
+
+kable(rmse_results %>% filter(RMSE == model5_rmse)) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+```
+  
+  
+**Model 6**: Adds the date the movie was rated rounded to the week (b~d~). 
+$$Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + b_{y} + b_{a} + b_{d} + \varepsilon_{i,u})$$  
+
+
+```{r model 6, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Model with when movie was rated 
+week_rated_avgs <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  group_by(week_rated) %>%
+  summarize(b_d = mean(rating - mu - b_i - b_u - b_y - b_a))
+
+predicted_ratings6 <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  mutate(pred = mu + b_i + b_u + b_y + b_a + b_d) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratings6[predicted_ratings6 < 0.5] <- .5
+predicted_ratings6[predicted_ratings6 > 5] <- 5
+
+# Calculating RMSE
+model6_rmse <- RMSE(predicted_ratings6, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model="Movie&User Reg + Year + Age&Week When Rated", RMSE = model6_rmse ))
+
+kable(rmse_results %>% filter(RMSE == model6_rmse)) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+# removing large/temp object
+rm(predicted_ratings4, predicted_ratings5, predicted_ratings6)
+```
+
+
+**Model 7**: Adds how many weeks since the user's first rating (b~uw~). 
+$$Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + b_{y} + b_{a} + b_{d} + b_{uw} + \varepsilon_{i,u})$$  
+
+
+```{r model 7, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Model with number of weeks since user's 1st rating
+weeksratedu_avgs <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>% 
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  group_by(weeksrated_u) %>%
+  summarize(b_uw = mean(rating - mu - b_i - b_u - b_y - b_a - b_d))
+
+predicted_ratings7 <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  mutate(pred = mu + b_i + b_u + b_y + b_a + b_d + b_uw) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratings7[predicted_ratings7 < 0.5] <- .5
+predicted_ratings7[predicted_ratings7 > 5] <- 5
+
+# Calculating RMSE
+model7_rmse <- RMSE(predicted_ratings7, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model="Movie/User Reg + Year + Age/Week Rated + User Rating Weeks",  RMSE = model7_rmse))
+
+kable(rmse_results %>% filter(RMSE == model7_rmse)) %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+```
+
+
+**Model 8**: Adds the effect of genres as they are combined in the data (b~g~).  
+$$Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + b_{y} + b_{a} + b_{d} + b_{uw} + b_{g} + \varepsilon_{i,u})$$
+
+
+```{r model 8, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Model 8: genre combinations effects
+genre_avgs <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  group_by(genres) %>%
+  summarize(b_g = mean(rating - mu - b_i - b_u - b_y - b_a - b_d - b_uw)) 
+
+predicted_ratings8 <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(pred = mu + b_i + b_u + b_y + b_a + b_d + b_uw + b_g) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratings8[predicted_ratings8 < 0.5] <- .5
+predicted_ratings8[predicted_ratings8 > 5] <- 5
+
+# Calculating RMSE
+model8_rmse <- RMSE(predicted_ratings8, test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model="Movie&User Reg + Year + Age&Week Rated + UserWeeks + GenreCombo",  RMSE = model8_rmse))
+
+rmse_results %>% filter(RMSE == model8_rmse) %>% kable() %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+
+```
+
+
+  
+The model including genre combinations did not improve RMSE as much as I expected. Possibly, this was be due to modeling the 791 unique genre combinations instead of factoring them out separately to model their interactions. However there is a lot of information not included in the MovieLens data that impacts ratings including: actors, directors, and user demographics like gender and age.  
+\  
+  
+  
+In order to improve on the model, I will user matrix factorization on the residuals from Model 8. "Matrix factorization is a class of collaborative filtering algorithms used in recommender systems. Matrix factorization algorithms work by decomposing the user-item interaction matrix into the product of two lower dimensionality rectangular matrices."^[https://en.wikipedia.org/wiki/Matrix_factorization_(recommender_systems)]  
+  
+\  
+
+
+**Model 9**: Matrix factorization of model's residuals.  Constructing a matrix with the vector of residuals from model 8 ($r$) with user vector ($p$) and movie vector ($q$).  $r_{u,i} \approx p_{u}q_{i}$
+
+$$Y_{i,u} = lim_{.5 \rightarrow 5}(\mu + b_{i} (\lambda) + b_{u} (\lambda) + b_{y} + b_{a} + b_{d} + b_{uw} + b_{g} + p_{u}q_{i} + \varepsilon_{i,u})$$
+
+I used the Recosystem package. First, I removed all large elements from my environment that were not be used in the matrix factorization. I calculated the residuals for training and test sets from model 8, and transposed them into matrix as: userId, movieId, residuals.  I constructed a Reco() object (r) the tuned parameters with on the training set based on [CRAN.R Project literature](https://cran.r-project.org/web/packages/recosystem/recosystem.pdf).  The model was then trained with minimized opts and predictions were generated for residuals which were then added to predicted ratings from model 8.  
+
+    
+
+```{r residuals, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Matrix Factorization of residuals from model 8 
+residuals <- train %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(b_res = (rating - mu - b_i - b_u - b_y - b_a - b_d - b_uw - b_g)) %>% select(userId, movieId, b_res)
+
+test_residuals <- test %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(b_res = (rating - mu - b_i - b_u - b_y - b_a - b_d - b_uw - b_g)) %>% select(userId, movieId, b_res)
+
+```
+
+```{r residuals-matrices, message = FALSE, error = FALSE,  warning = FALSE}
+
+# removing large objects from environment
+rm(train, predicted_ratings7, user_avgs, movie_avgs)
+
+# transforming training & test residuals to matrix
+residuals <- residuals %>% as.matrix()
+test_residuals <- test_residuals %>% as.matrix()
+
+```
+
+
+
+```{r model mf training, include = FALSE, echo = FALSE, message = FALSE, error = FALSE,  warning = FALSE}
+
+# write res and val matrices on disk & used # use recosystem option data_file() to specify source of dataset.
+write.table(residuals, file = "trainset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+write.table(test_residuals, file = "testset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+
+# Increasing memory limit
+memory.limit(size=48000)
+
+set.seed(123) # This is a randomized algorithm
+train_set = data_file("trainset.txt")
+test_set = data_file("testset.txt")
+
+# build a recommender object
+r <-Reco()
+
+# Set opts through r$tune in code. Hard coded opts$min here for speed:
+# opts <- r$tune(train_set, opts = list(dim = c(10, 20, 30), lrate = c(0.1, 0.2),
+#                                     costp_l1 = 0, costq_l1 = 0,
+#                                      nthread = 1, niter = 10))
+# opts$min
+# r$train(train_set, opts = c(opts$min, nthread = 1, niter = 20)) 
+
+# training recosystem model
+r$train(train_set, opts = c(dim = 30, lrate = 0.1,
+                            costp_l1 = 0, costq_l1 = 0,
+                            costp_l2 = 0.01, costq_l2 = 0.1,
+                            nthread = 1, niter = 20)) 
+```
+
+
+```{r model mf residuals, include = FALSE, message = FALSE, error = FALSE,  warning = FALSE}
+
+# predicting residuals
+pred_file <- tempfile()
+r$predict(test_set, out_file(pred_file))  
+predicted_residuals <- scan(pred_file)
+
+```
+
+
+```{r model mf preds, message = FALSE, error = FALSE,  warning = FALSE}
+
+# predicting ratings as model 8 predictions + recosystem predicted residuals
+predicted_ratings_mf <- predicted_ratings8 + predicted_residuals
+
+# Updating out-of-range predictions
+predicted_ratings_mf[predicted_ratings_mf < 0.5] <- .5
+predicted_ratings_mf[predicted_ratings_mf > 5] <- 5
+
+
+model_mf_rmse <- RMSE(predicted_ratings_mf,test$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model="Movie&User Reg + Year + Age&WeekRated + UserWeeks + Genres + Matrix Factorization",  
+                                     RMSE = model_mf_rmse ))
+
+rmse_results %>% filter(RMSE == model_mf_rmse) %>% kable() %>%  
+  kable_styling(font_size = 9, latex_options = "HOLD_position")
+
+```  
+  
+  
+Matrix factorization has improved the model considerably.  
+  
+\newpage  
+
+
+
+  
+## Final Model Validation
+
+For final validation, the model is tested with the original held-out validation set. I am looking to achieve a RMSE < .86490.  
+  
+  
+
+```{r final model 8, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Removing large files
+#rm(predicted_residuals, predicted_ratings8, predicted_ratings_mf, pred_file, residuals)
+
+# Model 8 predicted ratings validation set
+predicted_ratingsv <- validation1 %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(pred = mu + b_i + b_u + b_y + b_a + b_d + b_uw + b_g) %>% 
+  pull(pred)
+
+# Updating predictions to min and max
+predicted_ratingsv[predicted_ratingsv < 0.5] <- .5
+predicted_ratingsv[predicted_ratingsv > 5] <- 5
+
+# Calculating RMSE
+final8_rmse <- RMSE(predicted_ratingsv, validation1$rating)
+
+rmse_results <- bind_rows(rmse_results,
+                         data_frame(Model="Final: Movie&User Reg + Year + Age&Week Rated + User Rating Weeks",  RMSE = final8_rmse))
+```
+
+```{r final model residuals, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Calculating residuals for final model matrix factorization
+valid_residuals <- validation1 %>% 
+  left_join(movieavgs_reg, by='movieId') %>%
+  left_join(useravgs_reg, by='userId') %>%
+  left_join(year_avgs, by='year') %>%
+  left_join(age_rated_avgs, by='age_rated') %>%
+  left_join(week_rated_avgs, by='week_rated') %>%
+  left_join(weeksratedu_avgs, by='weeksrated_u') %>%
+  left_join(genre_avgs, by='genres') %>%
+  mutate(b_res = (rating - mu - b_i - b_u - b_y - b_a - b_d - b_uw - b_g)) %>% select(userId, movieId, b_res)
+
+valid_residuals <- valid_residuals %>% as.matrix()
+
+```
+
+
+```{r final model mf, include = FALSE, message = FALSE, error = FALSE,  warning = FALSE}
+
+# write valid matrix on disk 
+write.table(valid_residuals, file = "validset.txt" , sep = " " , row.names = FALSE, col.names = FALSE)
+
+valid_set = data_file("validset.txt")
+
+# predicting final residuals
+pred_file <- tempfile()
+r$predict(valid_set, out_file(pred_file))  
+predicted_residualsv <- scan(pred_file)
+```
+
+```{r final model mfpredict, message = FALSE, error = FALSE,  warning = FALSE}
+
+# predicting ratings as model 8 predictions + recosystem predicted residuals
+predicted_ratings_final <- predicted_ratingsv + predicted_residualsv
+
+# Updating out-of-range predictions
+predicted_ratings_final[predicted_ratings_final < 0.5] <- .5
+predicted_ratings_final[predicted_ratings_final > 5] <- 5
+
+
+final_mf_rmse <- RMSE(predicted_ratings_final,validation1$rating)
+rmse_results <- bind_rows(rmse_results,
+                          data_frame(Model = "Final: Movie&User Reg + Year + Age&WeekRated + UserWeeks + Genres + MatrixFactorzn",  
+                                     RMSE = final_mf_rmse))
+
+```
+  
+  
+**Final Validation Results**:  
+  
+```{r results, message = FALSE, error = FALSE,  warning = FALSE}
+
+kable(rmse_results[c(12:13), ], booktabs = TRUE) %>%  
+  kable_styling(font_size = 9, latex_options = c("striped", "HOLD_position"))
+```
+\  
+
+
+## Conclusion
+
+I have used the MovieLens 10M dataset to analyze movie ratings based on movie, user and time effects. The goal of the project was to build a model based on these discoveries to predict ratings achieving an RMSE of less than 0.8649.
+
+In the model above, RMSE decreases as we add predictors. Movie and User-specific effects along with regularization from the class model decreased RMSE the most at 11%, 8%, and 6% respectively. The year the movie was released, age when rated and genre combination effects decreased RMSE by 4% each.  The user date-rated effects were smaller at 2% each.  Modeling for genres was limited as there were 791 unique combinations although many had only one movie.  
+
+After modeling for effects found in the data, I used matrix factorization to discover latent effects.  Recosystem matrix factorization was used to process the residuals after movie, user and time effects were applied. Matrix factorization decreased RMSE to `r final_mf_rmse` a 25.5% improvement from guessing the average and well below the project goal.  
+
+RMSE measures the model accuracy, but looking at actual model outcomes can be more understandable. A comparison of the most rated movies from the validation set shows predictions within .04 of the actual rating.
+
+```{r valid preds compared, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Final predictions Comparison 
+final_pred <- as.data.frame(predicted_ratings_final)
+valid2 <- cbind(validation1, final_pred)
+top10 <- valid2 %>% group_by(title) %>% 
+  summarize(count = n(), avg_rating = mean(rating), prediction = mean(predicted_ratings_final)) %>% arrange(desc(count)) %>% slice(1:10)
+
+# Most rated movies
+kable(top10, digits = 2, booktabs = TRUE) %>% kable_styling(font_size = 9, latex_options = c("striped", "HOLD_position"))
+
+```
+  
+  
+But what about movies with less than average rating and fewer ratings? As the number of ratings declines, the accuracy naturally declines as well. The model performs relatively well as long as there are at least 100 ratings, but even with less only 50 to 100 ratings the predictions are still relatively close for the highest rated movies.
+
+```{r more preds, message = FALSE, error = FALSE,  warning = FALSE}
+
+# Movies w n 100:1000 & avg < 3
+top10_avg3 <- valid2 %>% group_by(title) %>% summarize(n = n(), avg = mean(rating), prediction= mean(predicted_ratings_final)) %>% 
+                    arrange(desc(avg)) %>% filter(n > 100 & n < 1000 & avg < 3) %>% slice(1:10) %>% mutate(title = sub("\\(.*)", "", title))
+
+# Movies with n 50 - 100
+top10_3 <- valid2 %>% group_by(title) %>% summarize(count = n(), avg_rating = mean(rating), prediction = mean(predicted_ratings_final)) %>% arrange(desc(avg_rating)) %>% filter(count > 50 & count < 100) %>% slice(1:10) %>% mutate(title = sub("\\(.*)", "", title))
+
+# combining to make easier to print
+more_preds <- cbind(top10_avg3,top10_3)
+
+kable(more_preds, digits = 2, booktabs = TRUE) %>% 
+  add_header_above(c("Top 10 Movies Average Rating < 3 (100-1000 Ratings)"=4,"Top 10 Movies (only 50-100 Ratings)"=4)) %>%
+  kable_styling(font_size = 8, latex_options = c("striped", "HOLD_position"))
+
+```
+
+
+There are many modeling alternatives.  I did not try linear regression. If genres were split apart and pivoted wide then formatted as factors and with movieId and userId also converted to factors, a regression equation with the movieId + userId + year + age rated + date rated + genre1 * genre2 * ...* genre20 where genre interaction could be incorporated which should provide a better results than model 8.  K-nearest-neighbors would also be powerful since like movies, users and genres are rated similarly. In fact Netflix uses 1300 neighborhoods in their very successful recommender system.  Joining this data with the IMDB data contain more movie-specific data such as actors or awards received would also be a good method although it would considerably increase the set size.  
+
+Overall, incorporating multiple effects even those with with small predicting capability combined with using matrix factorization of the residuals produced a relatively successful model.
